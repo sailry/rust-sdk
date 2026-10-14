@@ -46,6 +46,47 @@ fn parse_json_rpc_error(body: &str) -> Option<ServerJsonRpcMessage> {
     }
 }
 
+fn http_failure(response: &reqwest::Response) -> Option<HttpStatusError> {
+    (response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || response.status().is_server_error())
+    .then(|| HttpStatusError {
+        status: response.status().as_u16(),
+        retry_after: response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .filter(|value| value.len() <= 128)
+            .map(str::to_owned),
+    })
+}
+
+/// Bound a single JSON or error response before retaining or decoding its body.
+/// Streamed reads also enforce the limit when Content-Length is absent.
+async fn bounded_body(
+    mut response: reqwest::Response,
+    max_size: usize,
+) -> Result<Vec<u8>, StreamableHttpError<reqwest::Error>> {
+    let too_large = || {
+        StreamableHttpError::UnexpectedServerResponse(Cow::Borrowed(
+            "HTTP response body exceeded the maximum message size",
+        ))
+    };
+    if response
+        .content_length()
+        .is_some_and(|size| size > max_size as u64)
+    {
+        return Err(too_large());
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if chunk.len() > max_size.saturating_sub(body.len()) {
+            return Err(too_large());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
 impl StreamableHttpClient for reqwest::Client {
     type Error = reqwest::Error;
 
@@ -91,6 +132,9 @@ impl StreamableHttpClient for reqwest::Client {
         }
         request_builder = apply_custom_headers(request_builder, custom_headers)?;
         let response = request_builder.send().await?;
+        if let Some(error) = http_failure(&response) {
+            return Err(error.into());
+        }
         if response.status() == reqwest::StatusCode::METHOD_NOT_ALLOWED {
             return Err(StreamableHttpError::ServerDoesNotSupportSse);
         }
@@ -209,6 +253,9 @@ impl StreamableHttpClient for reqwest::Client {
             request = request.header(HEADER_SESSION_ID, session_id.as_ref());
         }
         let response = request.json(&message).send().await?;
+        if let Some(error) = http_failure(&response) {
+            return Err(error.into());
+        }
         if response.status() == reqwest::StatusCode::UNAUTHORIZED
             && let Some(header) = response.headers().get(WWW_AUTHENTICATE)
         {
@@ -276,10 +323,8 @@ impl StreamableHttpClient for reqwest::Client {
         // Non-success responses may carry valid JSON-RPC error payloads that
         // should be surfaced as McpError rather than lost in TransportSend.
         if !status.is_success() {
-            let body = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "<failed to read response body>".to_owned());
+            let bytes = bounded_body(response, max_sse_event_size).await?;
+            let body = String::from_utf8_lossy(&bytes);
             // Must precede the JSON-RPC branch below, which would forward a
             // discover rejection with an id the lifecycle cannot correlate.
             if let Some(response) =
@@ -314,7 +359,7 @@ impl StreamableHttpClient for reqwest::Client {
                 // reply. Treat an unusable JSON body as Accepted. A request
                 // still needs a reply; the same body is an error so the worker
                 // does not wait on SSE forever.
-                let body = response.bytes().await?;
+                let body = bounded_body(response, max_sse_event_size).await?;
                 match serde_json::from_slice::<ServerJsonRpcMessage>(&body) {
                     Ok(parsed) => Ok(StreamableHttpPostResponse::Json(parsed, session_id)),
                     Err(e)
@@ -416,6 +461,54 @@ mod tests {
         transport::streamable_http_client::{AuthRequiredError, InsufficientScopeError},
     };
 
+    #[tokio::test]
+    async fn retains_rate_limit_metadata_without_body() -> anyhow::Result<()> {
+        use std::{collections::HashMap, sync::Arc};
+
+        use axum::{Router, routing::post};
+
+        use crate::transport::streamable_http_client::{StreamableHttpClient, StreamableHttpError};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let server = tokio::spawn(async move {
+            let app = Router::new().route(
+                "/mcp",
+                post(|| async {
+                    (
+                        http::StatusCode::TOO_MANY_REQUESTS,
+                        [(http::header::RETRY_AFTER, "37")],
+                        "private-response",
+                    )
+                }),
+            );
+            axum::serve(listener, app).await
+        });
+        let message = ClientJsonRpcMessage::request(
+            ClientRequest::PingRequest(PingRequest::default()),
+            RequestId::Number(1),
+        );
+        let result = reqwest::Client::new()
+            .post_message_with_max_sse_event_size(
+                Arc::<str>::from(format!("http://{address}/mcp")),
+                message,
+                None,
+                Some("private-key".into()),
+                HashMap::new(),
+                1,
+            )
+            .await;
+        server.abort();
+        let Err(StreamableHttpError::HttpStatus(error)) = result else {
+            anyhow::bail!("typed rate limit expected")
+        };
+        assert_eq!(error.status, 429);
+        assert_eq!(error.retry_after.as_deref(), Some("37"));
+        assert_eq!(error.to_string(), "HTTP 429");
+        assert!(!format!("{error:?}").contains("private"));
+        Ok(())
+    }
+
     #[test]
     fn auth_required_error_new() {
         let err = AuthRequiredError::new("Bearer realm=\"test\"".to_string());
@@ -507,6 +600,65 @@ mod tests {
 
         server.abort();
         assert!(error.to_string().contains("maximum size of 16 bytes"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn post_body_honors_configured_size_limit() -> anyhow::Result<()> {
+        use std::{collections::HashMap, net::SocketAddr, sync::Arc};
+
+        use axum::{Router, routing::post};
+
+        use crate::transport::streamable_http_client::{StreamableHttpClient, StreamableHttpError};
+
+        let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+        let addr = listener.local_addr()?;
+        let server = tokio::spawn(async move {
+            let app = Router::new()
+                .route(
+                    "/success",
+                    post(|| async {
+                        (
+                            [(http::header::CONTENT_TYPE, "application/json")],
+                            r#"{"jsonrpc":"2.0","id":1,"result":{"padding":"oversized"}}"#,
+                        )
+                    }),
+                )
+                .route(
+                    "/error",
+                    post(|| async {
+                        (http::StatusCode::BAD_REQUEST, "error response is oversized")
+                    }),
+                );
+            axum::serve(listener, app).await
+        });
+
+        for path in ["success", "error"] {
+            let message = ClientJsonRpcMessage::request(
+                ClientRequest::PingRequest(PingRequest::default()),
+                RequestId::Number(1),
+            );
+            let result = reqwest::Client::new()
+                .post_message_with_max_sse_event_size(
+                    Arc::<str>::from(format!("http://{addr}/{path}")),
+                    message,
+                    None,
+                    None,
+                    HashMap::new(),
+                    16,
+                )
+                .await;
+            assert!(
+                matches!(
+                    result,
+                    Err(StreamableHttpError::UnexpectedServerResponse(ref message))
+                        if message.contains("maximum message size")
+                ),
+                "response body should be bounded for {path}: {result:?}"
+            );
+        }
+
+        server.abort();
         Ok(())
     }
 

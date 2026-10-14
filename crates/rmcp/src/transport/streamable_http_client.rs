@@ -176,9 +176,20 @@ impl InsufficientScopeError {
     }
 }
 
+/// HTTP failure metadata without a response body or request authentication.
+#[derive(Error, Debug, Clone)]
+#[error("HTTP {status}")]
+#[non_exhaustive]
+pub struct HttpStatusError {
+    pub status: u16,
+    pub retry_after: Option<String>,
+}
+
 #[derive(Error, Debug)]
 #[non_exhaustive]
 pub enum StreamableHttpError<E: std::error::Error + Send + Sync + 'static> {
+    #[error(transparent)]
+    HttpStatus(#[from] HttpStatusError),
     #[error("SSE error: {0}")]
     Sse(#[from] SseError),
     #[error("Io error: {0}")]
@@ -427,13 +438,14 @@ pub trait StreamableHttpClient: Clone + Send + 'static {
     ) -> impl Future<Output = Result<StreamableHttpPostResponse, StreamableHttpError<Self::Error>>>
     + Send
     + '_;
-    /// Send a message while enforcing a maximum raw SSE event size.
+    /// Send a message while enforcing the transport's response-size limit.
     ///
     /// `max_sse_event_size` is not a per-request option: it is the
     /// transport-wide [`StreamableHttpClientTransportConfig::max_sse_event_size`]
     /// value, passed identically on every call because the limit must be applied
     /// inside the client (at the raw byte layer, before SSE parsing) rather than
-    /// by the caller.
+    /// by the caller. The built-in reqwest client also applies it to buffered
+    /// JSON and error response bodies.
     ///
     /// Custom clients that parse SSE responses should override this method.
     /// The default implementation delegates to [`Self::post_message`].
@@ -556,6 +568,49 @@ struct SessionCleanupInfo<C> {
     session_id: Arc<str>,
     auth_header: Option<String>,
     protocol_headers: HashMap<HeaderName, HeaderValue>,
+}
+
+impl<C: StreamableHttpClient> SessionCleanupInfo<C> {
+    async fn finish(self) {
+        let cleanup_session_id = self.session_id.clone();
+        match tokio::time::timeout(
+            SESSION_CLEANUP_TIMEOUT,
+            self.client.delete_session(
+                self.uri,
+                self.session_id,
+                self.auth_header,
+                self.protocol_headers,
+            ),
+        )
+        .await
+        {
+            Ok(Ok(_)) => {
+                tracing::info!(
+                    session_id = cleanup_session_id.as_ref(),
+                    "delete session success"
+                )
+            }
+            Ok(Err(StreamableHttpError::ServerDoesNotSupportDeleteSession)) => {
+                tracing::info!(
+                    session_id = cleanup_session_id.as_ref(),
+                    "server doesn't support delete session"
+                )
+            }
+            Ok(Err(error)) => {
+                tracing::error!(
+                    session_id = cleanup_session_id.as_ref(),
+                    "fail to delete session: {error}"
+                );
+            }
+            Err(_elapsed) => {
+                tracing::warn!(
+                    session_id = cleanup_session_id.as_ref(),
+                    "session cleanup timed out after {:?}",
+                    SESSION_CLEANUP_TIMEOUT
+                );
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1049,46 +1104,18 @@ impl<C: StreamableHttpClient> StreamableHttpClientWorker<C> {
 
         Ok((new_session_id, negotiated_version, new_protocol_headers))
     }
-}
 
-impl<C: StreamableHttpClient> Worker for StreamableHttpClientWorker<C> {
-    type Role = RoleClient;
-    type Error = StreamableHttpError<C::Error>;
-    fn is_control_message(message: &ClientJsonRpcMessage) -> bool {
-        match message {
-            ClientJsonRpcMessage::Response(_) | ClientJsonRpcMessage::Error(_) => true,
-            ClientJsonRpcMessage::Notification(notification) => matches!(
-                notification.notification,
-                ClientNotification::CancelledNotification(_)
-            ),
-            ClientJsonRpcMessage::Request(_) => false,
-        }
-    }
-    fn supports_request_cancellation() -> bool {
-        true
-    }
-    fn err_closed() -> Self::Error {
-        StreamableHttpError::TransportChannelClosed
-    }
-    fn err_join(e: tokio::task::JoinError) -> Self::Error {
-        StreamableHttpError::TokioJoinError(e)
-    }
-    fn config(&self) -> super::worker::WorkerConfig {
-        super::worker::WorkerConfig {
-            name: Some("StreamableHttpClientWorker".into()),
-            channel_buffer_capacity: self.config.channel_buffer_capacity,
-        }
-    }
-    async fn run(
+    /// Runs initialization and message processing, leaving session cleanup to the owner.
+    async fn run_session(
         self,
         mut context: super::worker::WorkerContext<Self>,
-    ) -> Result<(), WorkerQuitReason<Self::Error>> {
+        session_cleanup_info: &mut Option<SessionCleanupInfo<C>>,
+    ) -> Result<(), WorkerQuitReason<StreamableHttpError<C::Error>>> {
         let channel_buffer_capacity = self.config.channel_buffer_capacity;
         let (sse_worker_tx, mut sse_worker_rx) =
             tokio::sync::mpsc::channel::<ServerJsonRpcMessage>(channel_buffer_capacity);
         let config = self.config.clone();
         let transport_task_ct = context.cancellation_token.clone();
-        let _drop_guard = transport_task_ct.clone().drop_guard();
         let WorkerSendRequest {
             responder,
             message: startup_request,
@@ -1125,6 +1152,20 @@ impl<C: StreamableHttpClient> Worker for StreamableHttpClientWorker<C> {
         {
             Ok(res) => {
                 let _ = responder.send(Ok(()));
+                if is_legacy_startup {
+                    let session = match &res {
+                        StreamableHttpPostResponse::Json(_, session)
+                        | StreamableHttpPostResponse::Sse(_, session) => session.as_ref(),
+                        StreamableHttpPostResponse::Accepted => None,
+                    };
+                    *session_cleanup_info = session.map(|session| SessionCleanupInfo {
+                        client: self.client.clone(),
+                        uri: config.uri.clone(),
+                        session_id: Arc::from(session.as_str()),
+                        auth_header: config.auth_header.clone(),
+                        protocol_headers: bootstrap_headers.clone(),
+                    });
+                }
                 res.expect_initialized::<C::Error>().await.map_err(
                     WorkerQuitReason::fatal_context("process initialize response"),
                 )?
@@ -1162,7 +1203,7 @@ impl<C: StreamableHttpClient> Worker for StreamableHttpClientWorker<C> {
         let mut tool_header_cache: HashMap<String, Arc<JsonObject>> = HashMap::new();
 
         // Store session info for cleanup when run() exits (not spawned, so cleanup completes before close() returns)
-        let mut session_cleanup_info = session_id.as_ref().map(|sid| SessionCleanupInfo {
+        *session_cleanup_info = session_id.as_ref().map(|sid| SessionCleanupInfo {
             client: self.client.clone(),
             uri: config.uri.clone(),
             session_id: sid.clone(),
@@ -1241,7 +1282,7 @@ impl<C: StreamableHttpClient> Worker for StreamableHttpClientWorker<C> {
         }
         // Each POST uses the session and headers chosen when it starts.
         // Only this loop updates the current session and protocol version.
-        let loop_result: Result<(), WorkerQuitReason<Self::Error>> = 'main_loop: loop {
+        'main_loop: loop {
             if retrying_recovery && recovery_posts.is_empty() && posts.is_empty() {
                 retrying_recovery = false;
             }
@@ -1290,7 +1331,7 @@ impl<C: StreamableHttpClient> Worker for StreamableHttpClientWorker<C> {
                         session_id = new_session_id;
                         negotiated_version = new_version;
                         protocol_headers = new_headers;
-                        session_cleanup_info = session_id.as_ref().map(|sid| SessionCleanupInfo {
+                        *session_cleanup_info = session_id.as_ref().map(|sid| SessionCleanupInfo {
                             client: self.client.clone(),
                             uri: config.uri.clone(),
                             session_id: sid.clone(),
@@ -1528,6 +1569,18 @@ impl<C: StreamableHttpClient> Worker for StreamableHttpClientWorker<C> {
                                 continue;
                             }
                         };
+                        let raw_session = match &response {
+                            StreamableHttpPostResponse::Json(_, session)
+                            | StreamableHttpPostResponse::Sse(_, session) => session.as_ref(),
+                            StreamableHttpPostResponse::Accepted => None,
+                        };
+                        *session_cleanup_info = raw_session.map(|session| SessionCleanupInfo {
+                            client: self.client.clone(),
+                            uri: config.uri.clone(),
+                            session_id: Arc::from(session.as_str()),
+                            auth_header: config.auth_header.clone(),
+                            protocol_headers: config.custom_headers.clone(),
+                        });
                         let (initialize_response, new_session_id) = response
                             .expect_initialized::<C::Error>()
                             .await
@@ -1545,7 +1598,7 @@ impl<C: StreamableHttpClient> Worker for StreamableHttpClientWorker<C> {
                             &initialize_response,
                             config.custom_headers.clone(),
                         );
-                        session_cleanup_info =
+                        *session_cleanup_info =
                             session_id.as_ref().map(|session_id| SessionCleanupInfo {
                                 client: self.client.clone(),
                                 uri: config.uri.clone(),
@@ -1578,7 +1631,7 @@ impl<C: StreamableHttpClient> Worker for StreamableHttpClientWorker<C> {
                             protocol_headers
                                 .insert(HeaderName::from_static("mcp-protocol-version"), value);
                         }
-                        if let Some(cleanup) = &mut session_cleanup_info {
+                        if let Some(cleanup) = session_cleanup_info.as_mut() {
                             cleanup.protocol_headers = protocol_headers.clone();
                         }
                     }
@@ -1794,57 +1847,62 @@ impl<C: StreamableHttpClient> Worker for StreamableHttpClientWorker<C> {
                     }
                 }
             }
+        }
+    }
+}
+
+impl<C: StreamableHttpClient> Worker for StreamableHttpClientWorker<C> {
+    type Role = RoleClient;
+    type Error = StreamableHttpError<C::Error>;
+
+    fn is_control_message(message: &ClientJsonRpcMessage) -> bool {
+        match message {
+            ClientJsonRpcMessage::Response(_) | ClientJsonRpcMessage::Error(_) => true,
+            ClientJsonRpcMessage::Notification(notification) => matches!(
+                notification.notification,
+                ClientNotification::CancelledNotification(_)
+            ),
+            ClientJsonRpcMessage::Request(_) => false,
+        }
+    }
+
+    fn supports_request_cancellation() -> bool {
+        true
+    }
+
+    fn err_closed() -> Self::Error {
+        StreamableHttpError::TransportChannelClosed
+    }
+
+    fn err_join(error: tokio::task::JoinError) -> Self::Error {
+        StreamableHttpError::TokioJoinError(error)
+    }
+
+    fn config(&self) -> super::worker::WorkerConfig {
+        super::worker::WorkerConfig {
+            name: Some("StreamableHttpClientWorker".into()),
+            channel_buffer_capacity: self.config.channel_buffer_capacity,
+        }
+    }
+
+    async fn run(
+        self,
+        context: super::worker::WorkerContext<Self>,
+    ) -> Result<(), WorkerQuitReason<Self::Error>> {
+        let transport_task_ct = context.cancellation_token.clone();
+        let _drop_guard = transport_task_ct.clone().drop_guard();
+        let mut session_cleanup_info = None;
+        let loop_result = tokio::select! {
+            biased;
+            _ = transport_task_ct.cancelled() => Err(WorkerQuitReason::Cancelled),
+            result = self.run_session(context, &mut session_cleanup_info) => result,
         };
 
-        // Stop outstanding http requests before deleting their session.
+        // Dropping the session future releases pending POSTs and aborts its stream tasks.
+        // DELETE must remain outside cancellation so close() can await bounded cleanup.
         transport_task_ct.cancel();
-        drop(posts);
-        drop(control_posts);
-        drop(pending_message);
-        drop(recovery_posts);
-        streams.abort_all();
-
-        // Cleanup session before returning (ensures close() waits for session deletion)
-        // Use a timeout to prevent indefinite hangs if the server is unresponsive
         if let Some(cleanup) = session_cleanup_info {
-            let cleanup_session_id = cleanup.session_id.clone();
-            match tokio::time::timeout(
-                SESSION_CLEANUP_TIMEOUT,
-                cleanup.client.delete_session(
-                    cleanup.uri,
-                    cleanup.session_id,
-                    cleanup.auth_header,
-                    cleanup.protocol_headers,
-                ),
-            )
-            .await
-            {
-                Ok(Ok(_)) => {
-                    tracing::info!(
-                        session_id = cleanup_session_id.as_ref(),
-                        "delete session success"
-                    )
-                }
-                Ok(Err(StreamableHttpError::ServerDoesNotSupportDeleteSession)) => {
-                    tracing::info!(
-                        session_id = cleanup_session_id.as_ref(),
-                        "server doesn't support delete session"
-                    )
-                }
-                Ok(Err(e)) => {
-                    tracing::error!(
-                        session_id = cleanup_session_id.as_ref(),
-                        "fail to delete session: {e}"
-                    );
-                }
-                Err(_elapsed) => {
-                    tracing::warn!(
-                        session_id = cleanup_session_id.as_ref(),
-                        "session cleanup timed out after {:?}",
-                        SESSION_CLEANUP_TIMEOUT
-                    );
-                }
-            }
+            cleanup.finish().await;
         }
 
         loop_result
@@ -2057,9 +2115,11 @@ pub struct StreamableHttpClientTransportConfig {
     pub custom_headers: HashMap<HeaderName, HeaderValue>,
     /// Maximum raw size of one SSE event accepted from the server.
     ///
-    /// The built-in reqwest and Unix socket clients enforce this value. Custom
-    /// [`StreamableHttpClient`] implementations must override the corresponding
-    /// `*_with_max_sse_event_size` methods to enforce it.
+    /// The built-in reqwest client also uses this as the maximum buffered JSON
+    /// or error response body size. The built-in reqwest and Unix socket clients
+    /// enforce the event limit. Custom [`StreamableHttpClient`] implementations
+    /// must override the corresponding `*_with_max_sse_event_size` methods to
+    /// enforce it.
     pub max_sse_event_size: usize,
     /// Automatically creates a new session when the server reports an expired
     /// session (`http 404`).
