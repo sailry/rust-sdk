@@ -558,6 +558,50 @@ struct SessionCleanupInfo<C> {
     protocol_headers: HashMap<HeaderName, HeaderValue>,
 }
 
+async fn cleanup_session<C: StreamableHttpClient>(cleanup: Option<SessionCleanupInfo<C>>) {
+    let Some(cleanup) = cleanup else {
+        return;
+    };
+    let cleanup_session_id = cleanup.session_id.clone();
+    match tokio::time::timeout(
+        SESSION_CLEANUP_TIMEOUT,
+        cleanup.client.delete_session(
+            cleanup.uri,
+            cleanup.session_id,
+            cleanup.auth_header,
+            cleanup.protocol_headers,
+        ),
+    )
+    .await
+    {
+        Ok(Ok(_)) => {
+            tracing::info!(
+                session_id = cleanup_session_id.as_ref(),
+                "delete session success"
+            )
+        }
+        Ok(Err(StreamableHttpError::ServerDoesNotSupportDeleteSession)) => {
+            tracing::info!(
+                session_id = cleanup_session_id.as_ref(),
+                "server doesn't support delete session"
+            )
+        }
+        Ok(Err(e)) => {
+            tracing::error!(
+                session_id = cleanup_session_id.as_ref(),
+                "fail to delete session: {e}"
+            );
+        }
+        Err(_elapsed) => {
+            tracing::warn!(
+                session_id = cleanup_session_id.as_ref(),
+                "session cleanup timed out after {:?}",
+                SESSION_CLEANUP_TIMEOUT
+            );
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct StreamableHttpClientWorker<C: StreamableHttpClient> {
@@ -1111,6 +1155,7 @@ impl<C: StreamableHttpClient> Worker for StreamableHttpClientWorker<C> {
                 &empty_tool_cache,
             )
         };
+        let mut session_cleanup_info = None;
         let (message, session_id) = match self
             .client
             .post_message_with_max_sse_event_size(
@@ -1125,9 +1170,30 @@ impl<C: StreamableHttpClient> Worker for StreamableHttpClientWorker<C> {
         {
             Ok(res) => {
                 let _ = responder.send(Ok(()));
-                res.expect_initialized::<C::Error>().await.map_err(
+                if is_legacy_startup {
+                    let raw_session = match &res {
+                        StreamableHttpPostResponse::Json(_, session)
+                        | StreamableHttpPostResponse::Sse(_, session) => session.as_ref(),
+                        StreamableHttpPostResponse::Accepted => None,
+                    };
+                    session_cleanup_info = raw_session.map(|session| SessionCleanupInfo {
+                        client: self.client.clone(),
+                        uri: config.uri.clone(),
+                        session_id: Arc::from(session.as_str()),
+                        auth_header: config.auth_header.clone(),
+                        protocol_headers: bootstrap_headers.clone(),
+                    });
+                }
+                let result = res.expect_initialized::<C::Error>().await.map_err(
                     WorkerQuitReason::fatal_context("process initialize response"),
-                )?
+                );
+                match result {
+                    Ok(initialized) => initialized,
+                    Err(error) => {
+                        cleanup_session(session_cleanup_info.take()).await;
+                        return Err(error);
+                    }
+                }
             }
             Err(err) => {
                 let msg = format!("{:?}", err);
@@ -1162,7 +1228,7 @@ impl<C: StreamableHttpClient> Worker for StreamableHttpClientWorker<C> {
         let mut tool_header_cache: HashMap<String, Arc<JsonObject>> = HashMap::new();
 
         // Store session info for cleanup when run() exits (not spawned, so cleanup completes before close() returns)
-        let mut session_cleanup_info = session_id.as_ref().map(|sid| SessionCleanupInfo {
+        session_cleanup_info = session_id.as_ref().map(|sid| SessionCleanupInfo {
             client: self.client.clone(),
             uri: config.uri.clone(),
             session_id: sid.clone(),
@@ -1528,12 +1594,28 @@ impl<C: StreamableHttpClient> Worker for StreamableHttpClientWorker<C> {
                                 continue;
                             }
                         };
-                        let (initialize_response, new_session_id) = response
-                            .expect_initialized::<C::Error>()
-                            .await
-                            .map_err(WorkerQuitReason::fatal_context(
-                                "process fallback initialize response",
-                            ))?;
+                        let raw_session = match &response {
+                            StreamableHttpPostResponse::Json(_, session)
+                            | StreamableHttpPostResponse::Sse(_, session) => session.as_ref(),
+                            StreamableHttpPostResponse::Accepted => None,
+                        };
+                        session_cleanup_info = raw_session.map(|session| SessionCleanupInfo {
+                            client: self.client.clone(),
+                            uri: config.uri.clone(),
+                            session_id: Arc::from(session.as_str()),
+                            auth_header: config.auth_header.clone(),
+                            protocol_headers: config.custom_headers.clone(),
+                        });
+                        let result = response.expect_initialized::<C::Error>().await.map_err(
+                            WorkerQuitReason::fatal_context("process fallback initialize response"),
+                        );
+                        let (initialize_response, new_session_id) = match result {
+                            Ok(initialized) => initialized,
+                            Err(error) => {
+                                cleanup_session(session_cleanup_info.take()).await;
+                                return Err(error);
+                            }
+                        };
                         session_id = new_session_id.map(Arc::from);
                         if session_id.is_none() && !config.allow_stateless {
                             return Err(WorkerQuitReason::fatal(
@@ -1806,46 +1888,7 @@ impl<C: StreamableHttpClient> Worker for StreamableHttpClientWorker<C> {
 
         // Cleanup session before returning (ensures close() waits for session deletion)
         // Use a timeout to prevent indefinite hangs if the server is unresponsive
-        if let Some(cleanup) = session_cleanup_info {
-            let cleanup_session_id = cleanup.session_id.clone();
-            match tokio::time::timeout(
-                SESSION_CLEANUP_TIMEOUT,
-                cleanup.client.delete_session(
-                    cleanup.uri,
-                    cleanup.session_id,
-                    cleanup.auth_header,
-                    cleanup.protocol_headers,
-                ),
-            )
-            .await
-            {
-                Ok(Ok(_)) => {
-                    tracing::info!(
-                        session_id = cleanup_session_id.as_ref(),
-                        "delete session success"
-                    )
-                }
-                Ok(Err(StreamableHttpError::ServerDoesNotSupportDeleteSession)) => {
-                    tracing::info!(
-                        session_id = cleanup_session_id.as_ref(),
-                        "server doesn't support delete session"
-                    )
-                }
-                Ok(Err(e)) => {
-                    tracing::error!(
-                        session_id = cleanup_session_id.as_ref(),
-                        "fail to delete session: {e}"
-                    );
-                }
-                Err(_elapsed) => {
-                    tracing::warn!(
-                        session_id = cleanup_session_id.as_ref(),
-                        "session cleanup timed out after {:?}",
-                        SESSION_CLEANUP_TIMEOUT
-                    );
-                }
-            }
-        }
+        cleanup_session(session_cleanup_info).await;
 
         loop_result
     }
@@ -2185,10 +2228,12 @@ mod tests {
 
     use super::*;
     use crate::{
+        ClientServiceExt,
         model::{
-            GetExtensions, ListToolsResult, NumberOrString, ServerRequest, ServerResult, Tool,
+            ClientConfig, ErrorCode, GetExtensions, ListToolsResult, NumberOrString, ServerRequest,
+            ServerResult, Tool,
         },
-        service::InboundStreamOrigin,
+        service::{ClientLifecycleMode, InboundStreamOrigin},
     };
 
     #[test]
@@ -2215,6 +2260,129 @@ mod tests {
         let msg = json_rpc_parse_error_message(&err, b"{}");
         assert!(msg.contains("could not parse JSON response as ServerJsonRpcMessage"));
         assert!(msg.contains("{}"), "missing body preview: {msg}");
+    }
+
+    #[derive(Clone, Copy)]
+    enum InvalidInitialize {
+        Malformed,
+        Empty,
+    }
+
+    #[derive(Clone)]
+    struct InvalidInitializeClient {
+        fallback: bool,
+        response: InvalidInitialize,
+        deleted: tokio::sync::mpsc::UnboundedSender<String>,
+    }
+
+    impl InvalidInitializeClient {
+        fn invalid_response(&self) -> StreamableHttpPostResponse {
+            let stream: BoxedSseStream = match self.response {
+                InvalidInitialize::Malformed => futures::stream::iter([Ok(Sse {
+                    event: None,
+                    data: Some("{".into()),
+                    id: None,
+                    retry: None,
+                })])
+                .boxed(),
+                InvalidInitialize::Empty => futures::stream::empty().boxed(),
+            };
+            StreamableHttpPostResponse::Sse(stream, Some("raw-session".into()))
+        }
+    }
+
+    impl StreamableHttpClient for InvalidInitializeClient {
+        type Error = std::io::Error;
+
+        async fn post_message(
+            &self,
+            _uri: Arc<str>,
+            message: ClientJsonRpcMessage,
+            _session_id: Option<Arc<str>>,
+            _auth_header: Option<String>,
+            _custom_headers: HashMap<HeaderName, HeaderValue>,
+        ) -> Result<StreamableHttpPostResponse, StreamableHttpError<Self::Error>> {
+            let ClientJsonRpcMessage::Request(request) = message else {
+                panic!("unexpected non-request during initialization")
+            };
+            match request.request {
+                ClientRequest::DiscoverRequest(_) => {
+                    assert!(self.fallback, "initial lifecycle must not send discover");
+                    Ok(StreamableHttpPostResponse::Json(
+                        ServerJsonRpcMessage::error(
+                            ErrorData::new(ErrorCode::METHOD_NOT_FOUND, "legacy server", None),
+                            Some(request.id),
+                        ),
+                        None,
+                    ))
+                }
+                ClientRequest::InitializeRequest(_) => Ok(self.invalid_response()),
+                other => panic!("unexpected initialization request: {other:?}"),
+            }
+        }
+
+        async fn delete_session(
+            &self,
+            _uri: Arc<str>,
+            session_id: Arc<str>,
+            _auth_header: Option<String>,
+            _custom_headers: HashMap<HeaderName, HeaderValue>,
+        ) -> Result<(), StreamableHttpError<Self::Error>> {
+            self.deleted
+                .send(session_id.to_string())
+                .expect("cleanup observer remains connected");
+            Ok(())
+        }
+
+        async fn get_stream(
+            &self,
+            _uri: Arc<str>,
+            _session_id: Option<Arc<str>>,
+            _last_event_id: Option<String>,
+            _auth_header: Option<String>,
+            _custom_headers: HashMap<HeaderName, HeaderValue>,
+        ) -> Result<BoxedSseStream, StreamableHttpError<Self::Error>> {
+            Ok(futures::stream::pending().boxed())
+        }
+    }
+
+    async fn assert_invalid_initialize_cleanup(fallback: bool) {
+        for response in [InvalidInitialize::Malformed, InvalidInitialize::Empty] {
+            let (deleted, mut deletions) = tokio::sync::mpsc::unbounded_channel();
+            let transport = StreamableHttpClientTransport::with_client(
+                InvalidInitializeClient {
+                    fallback,
+                    response,
+                    deleted,
+                },
+                StreamableHttpClientTransportConfig::with_uri("http://invalid-initialize/mcp"),
+            );
+            let lifecycle = if fallback {
+                ClientLifecycleMode::Auto {
+                    preferred_versions: vec![ProtocolVersion::V_2026_07_28],
+                    legacy_version: Some(ProtocolVersion::V_2025_11_25),
+                }
+            } else {
+                ClientLifecycleMode::Initialize
+            };
+            let result = ClientConfig::default()
+                .serve_with_lifecycle(transport, lifecycle)
+                .await;
+
+            assert!(result.is_err(), "invalid initialize response must fail");
+            assert_eq!(deletions.recv().await.as_deref(), Some("raw-session"));
+            assert!(deletions.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn initial_invalid_sse_cleans_session() {
+        assert_invalid_initialize_cleanup(false).await;
+    }
+
+    #[tokio::test]
+    async fn fallback_invalid_sse_cleans_session() {
+        assert_invalid_initialize_cleanup(true).await;
     }
 
     #[expect(
