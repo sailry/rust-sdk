@@ -48,7 +48,9 @@ fn parse_json_rpc_error(body: &str) -> Option<ServerJsonRpcMessage> {
 
 fn http_failure(response: &reqwest::Response) -> Option<HttpStatusError> {
     (response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS
-        || response.status().is_server_error())
+        || response.status().is_server_error()
+        || response.status() == reqwest::StatusCode::UNAUTHORIZED
+            && !response.headers().contains_key(WWW_AUTHENTICATE))
     .then(|| HttpStatusError {
         status: response.status().as_u16(),
         retry_after: response

@@ -90,6 +90,13 @@ async fn get_stream_401_without_challenge_is_not_auth_required() {
         "401 with no challenge header must not be classified as AuthRequired"
     );
     assert!(result.is_err(), "401 must still be an error");
+    match result {
+        Err(StreamableHttpError::HttpStatus(error)) => {
+            assert_eq!(error.status, 401);
+            assert!(error.retry_after.is_none());
+        }
+        other => panic!("expected HTTP status 401, got: {other:?}"),
+    }
 }
 
 /// 405 keeps its dedicated meaning — the server does not support SSE on GET —
