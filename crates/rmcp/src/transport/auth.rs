@@ -3,7 +3,10 @@ use std::{
     future::Future,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     pin::Pin,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU16, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -180,6 +183,7 @@ impl OAuthHttpClient for ReqwestOAuthHttpClient {
 struct OAuth2HttpClient<'a> {
     client: &'a dyn OAuthHttpClient,
     redirect_policy: OAuthHttpRedirectPolicy,
+    status: Option<&'a AtomicU16>,
 }
 
 #[derive(Debug)]
@@ -206,10 +210,15 @@ impl<'c> AsyncHttpClient<'c> for OAuth2HttpClient<'_> {
 
     fn call(&'c self, request: HttpRequest) -> Self::Future {
         Box::pin(async move {
-            self.client
+            let response = self
+                .client
                 .execute(OAuthHttpRequest::new(request, self.redirect_policy))
                 .await
-                .map_err(OAuth2HttpClientError)
+                .map_err(OAuth2HttpClientError)?;
+            if let Some(status) = self.status {
+                status.store(response.status().as_u16(), Ordering::Relaxed);
+            }
+            Ok(response)
         })
     }
 }
@@ -307,7 +316,7 @@ pub trait CredentialStore: Send + Sync {
 
     /// Optionally handle the provider's definitive rejection of a refresh token.
     ///
-    /// Called only for a definitive `invalid_grant` response, with the credentials used
+    /// Called only for HTTP 401 or a definitive `invalid_grant` response, with the credentials used
     /// for that exchange, before its refresh guard (if any) is released. Implementations
     /// must not reacquire that guard or change credentials that have since been replaced.
     /// The default leaves credentials unchanged. Callback errors are logged, and the
@@ -2173,6 +2182,7 @@ impl AuthorizationManager {
             .request_async(&OAuth2HttpClient {
                 client: self.http_client.as_ref(),
                 redirect_policy: OAuthHttpRedirectPolicy::Stop,
+                status: None,
             })
             .await
         {
@@ -2335,17 +2345,22 @@ impl AuthorizationManager {
         for scope in refresh_scopes {
             refresh_request = refresh_request.add_scope(Scope::new(scope));
         }
+        let status = AtomicU16::new(0);
         let mut token_result = match refresh_request
             .request_async(&OAuth2HttpClient {
                 client: self.http_client.as_ref(),
                 redirect_policy: self.refresh_redirect_policy,
+                status: Some(&status),
             })
             .await
         {
             Ok(token_result) => token_result,
             Err(error) => match &error {
-                RequestTokenError::ServerResponse(response)
-                    if response.error() == &BasicErrorResponseType::InvalidGrant =>
+                _ if status.load(Ordering::Relaxed) == StatusCode::UNAUTHORIZED.as_u16()
+                    || StatusCode::from_u16(status.load(Ordering::Relaxed))
+                        .is_ok_and(|status| !status.is_server_error())
+                        && matches!(&error, RequestTokenError::ServerResponse(response)
+                        if response.error() == &BasicErrorResponseType::InvalidGrant) =>
                 {
                     if let Err(store_error) = self
                         .credential_store
@@ -3327,6 +3342,7 @@ impl AuthorizationManager {
             .request_async(&OAuth2HttpClient {
                 client: self.http_client.as_ref(),
                 redirect_policy: OAuthHttpRedirectPolicy::Stop,
+                status: None,
             })
             .await
         {
@@ -9487,12 +9503,21 @@ mod tests {
         })
     }
 
-    fn refresh_error_http_client(store: &RefreshStore, error: &str) -> Arc<RefreshHttpClient> {
+    fn refresh_error_http_client(
+        store: &RefreshStore,
+        status: u16,
+        error: &str,
+    ) -> Arc<RefreshHttpClient> {
+        let response = if error == "plaintext" {
+            oauth2::http::Response::builder()
+                .status(status)
+                .body(b"unauthorized".to_vec())
+                .unwrap()
+        } else {
+            http_response(status, serde_json::json!({"error": error}))
+        };
         Arc::new(RefreshHttpClient {
-            recording: RecordingOAuthHttpClient::with_responses(vec![http_response(
-                400,
-                serde_json::json!({"error": error}),
-            )]),
+            recording: RecordingOAuthHttpClient::with_responses(vec![response]),
             events: store.events.clone(),
         })
     }
@@ -9557,16 +9582,21 @@ mod tests {
     }
 
     #[rstest]
-    #[case(None)]
-    #[case(Some("rejected"))]
+    #[case(None, 400, "invalid_grant")]
+    #[case(Some("rejected"), 400, "invalid_grant")]
+    #[case(None, 401, "invalid_client")]
+    #[case(Some("rejected"), 401, "invalid_client")]
+    #[case(None, 401, "plaintext")]
     #[tokio::test]
     async fn rejected_refresh_notifies_store_with_attempted_credentials_under_guard(
         #[case] fail_at: Option<&'static str>,
+        #[case] status: u16,
+        #[case] error: &str,
     ) {
         let mut store = refresh_store().await;
         store.fail_at = fail_at;
         let attempted = store.credentials.load().await.unwrap();
-        let http_client = refresh_error_http_client(&store, "invalid_grant");
+        let http_client = refresh_error_http_client(&store, status, error);
         let manager = refresh_manager(store.clone(), http_client.clone()).await;
 
         let error = manager.refresh_token().await.unwrap_err();
@@ -9597,7 +9627,7 @@ mod tests {
             .unwrap()
             .set_expires_in(Some(&std::time::Duration::ZERO));
         store.credentials.save(credentials).await.unwrap();
-        let http_client = refresh_error_http_client(&store, "invalid_grant");
+        let http_client = refresh_error_http_client(&store, 400, "invalid_grant");
         let manager = refresh_manager(store.clone(), http_client.clone()).await;
 
         assert!(matches!(
@@ -9615,10 +9645,19 @@ mod tests {
         assert!(store.lock.try_lock().is_ok());
     }
 
+    #[rstest]
+    #[case(400, "temporarily_unavailable")]
+    #[case(403, "temporarily_unavailable")]
+    #[case(500, "temporarily_unavailable")]
+    #[case(503, "temporarily_unavailable")]
+    #[case(503, "invalid_grant")]
     #[tokio::test]
-    async fn transient_refresh_failure_does_not_notify_store_of_rejection() {
+    async fn transient_refresh_failure_does_not_notify_store_of_rejection(
+        #[case] status: u16,
+        #[case] error: &str,
+    ) {
         let store = refresh_store().await;
-        let http_client = refresh_error_http_client(&store, "temporarily_unavailable");
+        let http_client = refresh_error_http_client(&store, status, error);
         let manager = refresh_manager(store.clone(), http_client).await;
 
         assert!(matches!(
@@ -9632,6 +9671,72 @@ mod tests {
             ["acquire", "acquired", "load", "provider", "release"]
         );
         assert!(store.lock.try_lock().is_ok());
+    }
+
+    #[rstest]
+    #[case("disconnect")]
+    #[case("timeout")]
+    #[case("cancel")]
+    #[tokio::test]
+    async fn interrupted_refresh_preserves_credentials(#[case] mode: &'static str) {
+        use tokio::io::AsyncReadExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let entered = Arc::new(Semaphore::new(0));
+        let started = entered.clone();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = [0; 4096];
+            assert!(socket.read(&mut bytes).await.unwrap() > 0);
+            started.add_permits(1);
+            if mode != "disconnect" {
+                std::future::pending::<()>().await;
+            }
+        });
+        let store = refresh_store().await;
+        let before = serde_json::to_value(store.credentials.load().await.unwrap()).unwrap();
+        let mut manager = AuthorizationManager::new(&format!("{origin}/mcp"))
+            .await
+            .unwrap();
+        manager
+            .with_client(
+                reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_millis(100))
+                    .build()
+                    .unwrap(),
+            )
+            .unwrap();
+        manager.set_metadata(AuthorizationMetadata {
+            authorization_endpoint: format!("{origin}/authorize"),
+            token_endpoint: format!("{origin}/token"),
+            ..Default::default()
+        });
+        manager.configure_client(test_client_config()).unwrap();
+        manager.set_credential_store(store.clone());
+        let operation = tokio::spawn(async move { manager.refresh_token().await });
+        wait_for_permits(&entered, 1).await;
+        if mode == "cancel" {
+            operation.abort();
+            assert!(operation.await.unwrap_err().is_cancelled());
+        } else {
+            assert!(matches!(
+                operation.await.unwrap(),
+                Err(AuthError::TokenRefreshFailed(_))
+            ));
+        }
+        assert_eq!(
+            serde_json::to_value(store.credentials.load().await.unwrap()).unwrap(),
+            before
+        );
+        assert!(store.rejected_credentials.lock().unwrap().is_none());
+        assert_eq!(
+            *store.events.lock().unwrap(),
+            ["acquire", "acquired", "load", "release"]
+        );
+        assert!(store.lock.try_lock().is_ok());
+        server.abort();
+        let _ = server.await;
     }
 
     #[tokio::test]
