@@ -51,7 +51,11 @@ fn http_failure(response: &reqwest::Response) -> Option<HttpStatusError> {
         || response.status().is_server_error()
         || response.status() == reqwest::StatusCode::UNAUTHORIZED
             && !response.headers().contains_key(WWW_AUTHENTICATE))
-    .then(|| HttpStatusError {
+    .then(|| http_status(response))
+}
+
+fn http_status(response: &reqwest::Response) -> HttpStatusError {
+    HttpStatusError {
         status: response.status().as_u16(),
         retry_after: response
             .headers()
@@ -59,7 +63,7 @@ fn http_failure(response: &reqwest::Response) -> Option<HttpStatusError> {
             .and_then(|value| value.to_str().ok())
             .filter(|value| value.len() <= 128)
             .map(str::to_owned),
-    })
+    }
 }
 
 /// Bound a single JSON or error response before retaining or decoding its body.
@@ -171,7 +175,9 @@ impl StreamableHttpClient for reqwest::Client {
                 },
             ));
         }
-        let response = response.error_for_status()?;
+        if !response.status().is_success() {
+            return Err(http_status(&response).into());
+        }
         match response.headers().get(reqwest::header::CONTENT_TYPE) {
             Some(ct) => {
                 if !ct.as_bytes().starts_with(EVENT_STREAM_MIME_TYPE.as_bytes())
@@ -325,6 +331,7 @@ impl StreamableHttpClient for reqwest::Client {
         // Non-success responses may carry valid JSON-RPC error payloads that
         // should be surfaced as McpError rather than lost in TransportSend.
         if !status.is_success() {
+            let failure = http_status(&response);
             let bytes = bounded_body(response, max_sse_event_size).await?;
             let body = String::from_utf8_lossy(&bytes);
             // Must precede the JSON-RPC branch below, which would forward a
@@ -347,9 +354,7 @@ impl StreamableHttpClient for reqwest::Client {
                     ),
                 }
             }
-            return Err(StreamableHttpError::UnexpectedServerResponse(Cow::Owned(
-                format!("HTTP {status}: {body}"),
-            )));
+            return Err(failure.into());
         }
         match content_type.as_deref() {
             Some(ct) if ct.as_bytes().starts_with(EVENT_STREAM_MIME_TYPE.as_bytes()) => {
@@ -779,7 +784,7 @@ mod tests {
         assert!(
             matches!(
                 result,
-                Err(StreamableHttpError::UnexpectedServerResponse(_))
+                Err(StreamableHttpError::HttpStatus(ref error)) if error.status == 307
             ),
             "redirect response should be returned to the transport, got {result:?}"
         );

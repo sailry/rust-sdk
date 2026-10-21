@@ -44,6 +44,63 @@ async fn get_stream_against(
         .map(|_| ())
 }
 
+#[tokio::test]
+async fn preserves_non_authentication_statuses() {
+    let mut failures = Vec::new();
+    for status in [400, 403, 429, 503] {
+        match get_stream_against(status, None).await {
+            Err(StreamableHttpError::HttpStatus(error)) => assert_eq!(error.status, status),
+            other => failures.push(format!("{status}: {other:?}")),
+        }
+    }
+    assert!(failures.is_empty(), "HTTP status was lost: {failures:?}");
+}
+
+#[tokio::test]
+async fn network_failures_have_no_status() {
+    use rmcp::model::{ClientJsonRpcMessage, ClientRequest, PingRequest, RequestId};
+
+    for post in [false, true] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url: Arc<str> = format!("http://{}/mcp", listener.local_addr().unwrap()).into();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            drop(stream);
+        });
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .retry(reqwest::retry::never())
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let result = if post {
+            client
+                .post_message(
+                    url,
+                    ClientJsonRpcMessage::request(
+                        ClientRequest::PingRequest(PingRequest::default()),
+                        RequestId::Number(1),
+                    ),
+                    None,
+                    None,
+                    HashMap::new(),
+                )
+                .await
+                .map(|_| ())
+        } else {
+            client
+                .get_stream(url, None, None, None, HashMap::new())
+                .await
+                .map(|_| ())
+        };
+        match result {
+            Err(StreamableHttpError::Client(error)) => assert!(error.status().is_none()),
+            other => panic!("expected a network failure without HTTP status, got: {other:?}"),
+        }
+        server.await.unwrap();
+    }
+}
+
 /// A 401 carrying a `WWW-Authenticate` challenge must surface as `AuthRequired`,
 /// which is the variant `AuthClient::call_reacting_to_challenges` catches to
 /// refresh the token and retry. Classified as a plain `Client` error instead, the
