@@ -2329,9 +2329,19 @@ impl AuthorizationManager {
             .as_ref()
             .ok_or(AuthError::AuthorizationRequired)?;
 
-        let refresh_token = current_credentials
-            .refresh_token()
-            .ok_or(AuthError::AuthorizationRequired)?;
+        let Some(refresh_token) = current_credentials.refresh_token() else {
+            if let Err(store_error) = self
+                .credential_store
+                .on_refresh_token_rejected(&stored_credentials)
+                .await
+            {
+                tracing::warn!(
+                    error = %store_error,
+                    "Failed to handle unrefreshable token"
+                );
+            }
+            return Err(AuthError::AuthorizationRequired);
+        };
         debug!("refresh token present, attempting refresh");
 
         let refresh_token_value = RefreshToken::new(refresh_token.secret().to_string());
@@ -2360,7 +2370,8 @@ impl AuthorizationManager {
                     || StatusCode::from_u16(status.load(Ordering::Relaxed))
                         .is_ok_and(|status| !status.is_server_error())
                         && matches!(&error, RequestTokenError::ServerResponse(response)
-                        if response.error() == &BasicErrorResponseType::InvalidGrant) =>
+                        if matches!(response.error(), BasicErrorResponseType::InvalidGrant
+                            | BasicErrorResponseType::InvalidClient)) =>
                 {
                     if let Err(store_error) = self
                         .credential_store
@@ -9584,6 +9595,8 @@ mod tests {
     #[rstest]
     #[case(None, 400, "invalid_grant")]
     #[case(Some("rejected"), 400, "invalid_grant")]
+    #[case(None, 400, "invalid_client")]
+    #[case(Some("rejected"), 400, "invalid_client")]
     #[case(None, 401, "invalid_client")]
     #[case(Some("rejected"), 401, "invalid_client")]
     #[case(None, 401, "plaintext")]
@@ -9646,11 +9659,85 @@ mod tests {
     }
 
     #[rstest]
+    #[case(None)]
+    #[case(Some("rejected"))]
+    #[tokio::test]
+    async fn unrefreshable_tokens_notify_the_guarded_store(#[case] fail_at: Option<&'static str>) {
+        let mut store = refresh_store().await;
+        store.fail_at = fail_at;
+        let mut credentials = store.credentials.load().await.unwrap().unwrap();
+        let token = credentials.token_response.as_mut().unwrap();
+        token.set_refresh_token(None);
+        token.set_expires_in(Some(&std::time::Duration::ZERO));
+        store.credentials.save(credentials.clone()).await.unwrap();
+        let http_client = refresh_http_client(&store);
+        let manager = refresh_manager(store.clone(), http_client.clone()).await;
+
+        assert!(matches!(
+            manager.get_access_token().await,
+            Err(AuthError::AuthorizationRequired)
+        ));
+
+        assert_eq!(
+            serde_json::to_value(&*store.rejected_credentials.lock().unwrap()).unwrap(),
+            serde_json::to_value(Some(credentials)).unwrap()
+        );
+        assert_eq!(
+            *store.events.lock().unwrap(),
+            ["load", "acquire", "acquired", "load", "rejected", "release"]
+        );
+        assert!(http_client.recording.requests().is_empty());
+        assert!(store.lock.try_lock().is_ok());
+    }
+
+    #[rstest]
+    #[case("absent")]
+    #[case("registration")]
+    #[case("foreign")]
+    #[tokio::test]
+    async fn missing_authorization_does_not_reject_unattempted_credentials(#[case] mode: &str) {
+        let store = refresh_store().await;
+        if mode == "absent" {
+            store.credentials.clear().await.unwrap();
+        } else {
+            let mut credentials = store.credentials.load().await.unwrap().unwrap();
+            if mode == "registration" {
+                credentials.token_response = None;
+            } else {
+                credentials.client_id = "another-client".into();
+                credentials
+                    .token_response
+                    .as_mut()
+                    .unwrap()
+                    .set_expires_in(Some(&std::time::Duration::ZERO));
+            }
+            store.credentials.save(credentials).await.unwrap();
+        }
+        let before = serde_json::to_value(store.credentials.load().await.unwrap()).unwrap();
+        let http_client = refresh_http_client(&store);
+        let manager = refresh_manager(store.clone(), http_client.clone()).await;
+
+        assert!(matches!(
+            manager.get_access_token().await,
+            Err(AuthError::AuthorizationRequired)
+        ));
+
+        assert!(store.rejected_credentials.lock().unwrap().is_none());
+        assert_eq!(
+            serde_json::to_value(store.credentials.load().await.unwrap()).unwrap(),
+            before
+        );
+        assert!(http_client.recording.requests().is_empty());
+        assert!(store.lock.try_lock().is_ok());
+    }
+
+    #[rstest]
     #[case(400, "temporarily_unavailable")]
     #[case(403, "temporarily_unavailable")]
     #[case(500, "temporarily_unavailable")]
     #[case(503, "temporarily_unavailable")]
     #[case(503, "invalid_grant")]
+    #[case(503, "invalid_client")]
     #[tokio::test]
     async fn transient_refresh_failure_does_not_notify_store_of_rejection(
         #[case] status: u16,
